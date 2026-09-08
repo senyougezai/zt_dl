@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Zeta 会話ログ一括保存ツール",
+  "version": "1.1",
+  "description": "Zetaのチャット履歴を名前と件数を指定して一括エクスポートします。",
+  "content_scripts": [
+    {
+      "matches": ["https://zeta-ai.io/*"],
+      "js": ["content.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    }
+  ]
+}
