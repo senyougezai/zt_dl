@@ -3,40 +3,94 @@
 
     let capturedToken = null;
 
-    // 1. 通信から Authorization Token を自動抽出
+    // 辅助函数：从任意 Header 格式中提取 Bearer
+    function extractBearer(headers) {
+        if (!headers) return null;
+        try {
+            if (headers instanceof Headers) {
+                const h = headers.get('authorization') || headers.get('Authorization');
+                if (h && h.startsWith('Bearer ')) return h;
+            } else if (Array.isArray(headers)) {
+                for (const [k, v] of headers) {
+                    if (k.toLowerCase() === 'authorization' && typeof v === 'string' && v.startsWith('Bearer ')) return v;
+                }
+            } else if (typeof headers === 'object') {
+                for (const k of Object.keys(headers)) {
+                    if (k.toLowerCase() === 'authorization') {
+                        const v = headers[k];
+                        if (typeof v === 'string' && v.startsWith('Bearer ')) return v;
+                    }
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function saveToken(token) {
+        if (token && token.startsWith('Bearer ')) {
+            capturedToken = token;
+            try { sessionStorage.setItem('zeta_ext_token', token); } catch (e) {}
+            // 如果弹窗已打开，实时更新状态
+            updateModalTokenStatus();
+        }
+    }
+
+    // 1. 拦截 fetch (兼容 Request 对象与普通参数)
     const originalFetch = window.fetch;
     window.fetch = async function (...args) {
         try {
-            const [, config] = args;
-            if (config && config.headers) {
-                let auth = null;
-                if (config.headers instanceof Headers) {
-                    auth = config.headers.get('authorization') || config.headers.get('Authorization');
-                } else if (typeof config.headers === 'object') {
-                    auth = config.headers['authorization'] || config.headers['Authorization'];
-                }
-                if (auth && auth.startsWith('Bearer ')) {
-                    capturedToken = auth;
-                    sessionStorage.setItem('zeta_ext_token', auth);
-                }
+            let auth = null;
+            if (args[0] instanceof Request) {
+                auth = extractBearer(args[0].headers);
             }
+            if (!auth && args[1] && args[1].headers) {
+                auth = extractBearer(args[1].headers);
+            }
+            if (auth) saveToken(auth);
         } catch (e) {}
         return originalFetch.apply(this, args);
     };
 
+    // 2. 拦截 XMLHttpRequest (兼容 Axios 等请求库)
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+    XMLHttpRequest.prototype.setRequestHeader = function (header, value) {
+        try {
+            if (typeof header === 'string' && header.toLowerCase() === 'authorization') {
+                if (typeof value === 'string' && value.startsWith('Bearer ')) {
+                    saveToken(value);
+                }
+            }
+        } catch (e) {}
+        return originalSetRequestHeader.apply(this, arguments);
+    };
+
+    // 3. 内存与存储区扫描
     function getToken() {
         if (capturedToken) return capturedToken;
-        const saved = sessionStorage.getItem('zeta_ext_token');
-        if (saved) return saved;
+        try {
+            const saved = sessionStorage.getItem('zeta_ext_token');
+            if (saved) return saved;
 
-        for (let i = 0; i < localStorage.length; i++) {
-            const val = localStorage.getItem(localStorage.key(i));
-            if (typeof val === 'string' && val.includes('eyJhbGciOi')) {
-                const match = val.match(/eyJhbGciOi[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
-                if (match) return 'Bearer ' + match[0];
-            }
+            const scan = (storage) => {
+                for (let i = 0; i < storage.length; i++) {
+                    const val = storage.getItem(storage.key(i));
+                    if (!val) continue;
+                    const match = val.match(/Bearer\s+(eyJhbGciOi[a-zA-Z0-9_\-\.]+)/i) || 
+                                  val.match(/(eyJhbGciOi[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)/);
+                    if (match) {
+                        const tokenStr = match[1] || match[0];
+                        return tokenStr.startsWith('Bearer ') ? tokenStr : 'Bearer ' + tokenStr;
+                    }
+                }
+                return null;
+            };
+
+            return scan(localStorage) || scan(sessionStorage);
+        } catch (e) {
+            return null;
         }
-        return null;
     }
 
     function getRoomId() {
@@ -44,21 +98,27 @@
         return match ? match[1] : null;
     }
 
-    // 2. 設定ダイアログ（モーダル）の作成
+    function updateModalTokenStatus() {
+        const statusEl = document.getElementById('zeta-token-status');
+        const inputEl = document.getElementById('zeta-input-token');
+        const token = getToken();
+        if (statusEl && token) {
+            statusEl.innerHTML = '<span style="color: #10b981;">✅ 認証キー取得完了</span>';
+            if (inputEl && !inputEl.value) inputEl.value = token;
+        }
+    }
+
+    // 4. 弹窗界面
     function showModal() {
         const roomId = getRoomId();
         if (!roomId) {
-            alert('⚠️ トークルームを開いた状態で実行してください。');
-            return;
-        }
-
-        const token = getToken();
-        if (!token) {
-            alert('⚠️ 認証キーを認識中です。画面を少し上にスクロールして過去ログを一度読み込んでから再度お試しください。');
+            alert('⚠️ トークルーム（会話画面）を開いた状態でクリックしてください。');
             return;
         }
 
         if (document.getElementById('zeta-modal-overlay')) return;
+
+        const currentToken = getToken() || '';
 
         const overlay = document.createElement('div');
         overlay.id = 'zeta-modal-overlay';
@@ -72,21 +132,31 @@
         const modal = document.createElement('div');
         modal.style.cssText = `
             background: #1e1e24; color: #f3f4f6; border-radius: 12px;
-            padding: 24px; width: 340px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            padding: 24px; width: 360px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
             border: 1px solid #374151;
         `;
 
         modal.innerHTML = `
-            <h3 style="margin: 0 0 16px; font-size: 18px; text-align: center;">📥 ログ保存の設定</h3>
-            <div style="margin-bottom: 14px;">
+            <h3 style="margin: 0 0 16px; font-size: 18px; text-align: center;">📥 ログ保存設定</h3>
+            
+            <div style="margin-bottom: 12px;">
+                <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px;">
+                    <label style="color: #9ca3af;">認証キー(Token):</label>
+                    <span id="zeta-token-status">${currentToken ? '<span style="color: #10b981;">✅ 取得済み</span>' : '<span style="color: #f59e0b;">⏳ 画面をスクロールで自動取得</span>'}</span>
+                </div>
+                <input id="zeta-input-token" type="text" value="${currentToken}" placeholder="未取得の場合は画面を上にスクロールするか、直接ペースト" style="width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #fff; font-size: 12px;" />
+            </div>
+
+            <div style="margin-bottom: 12px;">
                 <label style="display: block; font-size: 13px; color: #9ca3af; margin-bottom: 6px;">あなたの表示名:</label>
                 <input id="zeta-input-username" type="text" value="まな" style="width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #fff; font-size: 14px;" />
             </div>
+
             <div style="margin-bottom: 20px;">
                 <label style="display: block; font-size: 13px; color: #9ca3af; margin-bottom: 6px;">取得件数 (最新N件):</label>
                 <input id="zeta-input-limit" type="number" value="10000" min="10" max="10000" step="50" style="width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px; border: 1px solid #4b5563; background: #111827; color: #fff; font-size: 14px;" />
-                <span style="font-size: 11px; color: #6b7280; display: block; margin-top: 4px;">※ 全件保存したい場合は「10000」のままでOK</span>
             </div>
+
             <div style="display: flex; justify-content: flex-end; gap: 10px;">
                 <button id="zeta-btn-cancel" style="padding: 8px 14px; background: transparent; color: #9ca3af; border: 1px solid #4b5563; border-radius: 6px; cursor: pointer;">キャンセル</button>
                 <button id="zeta-btn-run" style="padding: 8px 16px; background: #6366f1; color: #fff; border: none; border-radius: 6px; font-weight: bold; cursor: pointer;">ダウンロード開始</button>
@@ -98,13 +168,21 @@
 
         document.getElementById('zeta-btn-cancel').onclick = () => overlay.remove();
         document.getElementById('zeta-btn-run').onclick = () => {
+            const rawToken = document.getElementById('zeta-input-token').value.trim();
+            const finalToken = rawToken.startsWith('Bearer ') ? rawToken : (rawToken ? 'Bearer ' + rawToken : '');
+            
+            if (!finalToken) {
+                alert('⚠️ 認証キーが取得できていません。チャット画面を少し上にスクロールして過去ログを読み込ませるか、手動でキーを貼り付けてください。');
+                return;
+            }
+
             const userName = document.getElementById('zeta-input-username').value.trim() || 'あなた';
             const limit = parseInt(document.getElementById('zeta-input-limit').value, 10) || 10000;
-            executeDownload(roomId, token, userName, limit, overlay);
+            executeDownload(roomId, finalToken, userName, limit, overlay);
         };
     }
 
-    // 3. ダウンロード処理
+    // 5. 执行下载
     async function executeDownload(roomId, token, userName, limit, overlay) {
         const runBtn = document.getElementById('zeta-btn-run');
         runBtn.innerText = '取得中...';
@@ -129,14 +207,13 @@
 
             if (messages.length === 0) {
                 alert('⚠️ メッセージを取得できませんでした。');
-                overlay.remove();
+                runBtn.innerText = 'ダウンロード開始';
+                runBtn.disabled = false;
                 return;
             }
 
-            // 時系列（昇順）にソート
             messages.sort((a, b) => new Date(a.messageTime) - new Date(b.messageTime));
 
-            // 指定件数に切り詰め（最新N件）
             if (messages.length > limit) {
                 messages = messages.slice(-limit);
             }
@@ -167,13 +244,13 @@
             overlay.remove();
         } catch (err) {
             console.error(err);
-            alert('❌ 取得に失敗しました。少し上にスクロールして再度お試しください。');
+            alert('❌ 取得に失敗しました(401等の可能性)。キーを確認してください。');
             runBtn.innerText = 'ダウンロード開始';
             runBtn.disabled = false;
         }
     }
 
-    // 4. 画面右下にトリガーボタンを常駐
+    // 6. 右下常驻按钮
     function injectFloatingButton() {
         if (document.getElementById('zeta-trigger-btn')) return;
 
